@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -220,6 +221,9 @@ func (m *Model) updateEditor(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.editValue = m.editValue[:len(m.editValue)-1]
 		}
 
+	case "space":
+		m.editValue += " "
+
 	default:
 		text := msg.String()
 
@@ -369,10 +373,18 @@ func (m *Model) inspectorFields() []InspectorField {
 	}
 
 	if m.selected.Properties != nil {
-		for key, value := range m.selected.Properties {
+		keys := make([]string, 0, len(m.selected.Properties))
+
+		for key := range m.selected.Properties {
+			keys = append(keys, key)
+		}
+
+		sort.Strings(keys)
+
+		for _, key := range keys {
 			fields = append(fields, InspectorField{
 				Name:  key,
-				Value: value,
+				Value: m.selected.Properties[key],
 			})
 		}
 	}
@@ -572,6 +584,86 @@ func (m Model) View() tea.View {
 	return view
 }
 
+func (m Model) footerRows(width int) []string {
+	var shortcuts []string
+
+	if m.editing {
+		shortcuts = []string{
+			keyStyle.Render("Type") + " edit",
+			keyStyle.Render("Enter") + " apply",
+			keyStyle.Render("Esc") + " cancel",
+		}
+	} else {
+		switch m.panel {
+		case PanelPalette:
+			shortcuts = []string{
+				keyStyle.Render("↑↓") + " navigate",
+				keyStyle.Render("Enter/A") + " add",
+				keyStyle.Render("Tab") + " panels",
+				keyStyle.Render("Q") + " quit",
+			}
+
+		case PanelCanvas:
+			shortcuts = []string{
+				keyStyle.Render("←↑↓→") + " move",
+				keyStyle.Render("Shift+Arrows") + " resize",
+				keyStyle.Render("D") + " delete",
+				keyStyle.Render("Tab") + " panels",
+			}
+
+		case PanelHierarchy:
+			shortcuts = []string{
+				keyStyle.Render("↑↓") + " navigate",
+				keyStyle.Render("Enter") + " select",
+				keyStyle.Render("D") + " delete",
+				keyStyle.Render("Tab") + " panels",
+			}
+
+		case PanelInspector:
+			shortcuts = []string{
+				keyStyle.Render("↑↓") + " properties",
+				keyStyle.Render("Enter") + " edit",
+				keyStyle.Render("Tab") + " panels",
+				keyStyle.Render("Q") + " quit",
+			}
+		}
+	}
+
+	available := width - 3
+	if available < 1 {
+		available = 1
+	}
+
+	var rows []string
+	var current string
+
+	for _, shortcut := range shortcuts {
+		candidate := shortcut
+
+		if current != "" {
+			candidate = current + "  " + shortcut
+		}
+
+		if current != "" && lipgloss.Width(candidate) > available {
+			rows = append(rows, current)
+			current = shortcut
+			continue
+		}
+
+		current = candidate
+	}
+
+	if current != "" {
+		rows = append(rows, current)
+	}
+
+	if len(rows) == 0 {
+		rows = []string{""}
+	}
+
+	return rows
+}
+
 func (m Model) render() string {
 	if m.width < 60 || m.height < 15 {
 		return fmt.Sprintf(
@@ -588,8 +680,11 @@ func (m Model) render() string {
 		headerHeight    = 1
 		statusHeight    = 1
 		hierarchyHeight = 6
-		footerHeight    = 1
 	)
+
+	// The footer can occupy more than one row when the terminal
+	// is narrow. Reserve its actual height before rendering anything.
+	footerHeight := len(m.footerRows(m.width))
 
 	editorHeight :=
 		m.height -
@@ -606,8 +701,11 @@ func (m Model) render() string {
 	inspectorWidth := 26
 	canvasWidth := m.width - paletteWidth - inspectorWidth
 
-	header := m.renderHeader(m.width, headerHeight)
+	if canvasWidth < 10 {
+		canvasWidth = 10
+	}
 
+	header := m.renderHeader(m.width, headerHeight)
 	status := m.renderStatus(m.width, statusHeight)
 
 	editor := lipgloss.JoinHorizontal(
@@ -622,10 +720,7 @@ func (m Model) render() string {
 		hierarchyHeight,
 	)
 
-	footer := m.renderFooter(
-		m.width,
-		footerHeight,
-	)
+	footer := m.renderFooter(m.width)
 
 	return appStyle.Render(
 		lipgloss.JoinVertical(
@@ -1103,7 +1198,42 @@ func (m Model) renderHierarchy(width, height int) string {
 		mutedStyle.Render("▼ root"),
 	}
 
-	for i, node := range m.document.Root.Children {
+	children := m.document.Root.Children
+
+	// Account for the panel border and padding.
+	// The hierarchy has:
+	//   1 title
+	//   1 blank line
+	//   1 root line
+	// leaving the rest for children.
+	visibleChildren := height - 5
+
+	if visibleChildren < 1 {
+		visibleChildren = 1
+	}
+
+	start := 0
+
+	if m.hierarchyCursor >= visibleChildren {
+		start = m.hierarchyCursor - visibleChildren + 1
+	}
+
+	end := start + visibleChildren
+
+	if end > len(children) {
+		end = len(children)
+	}
+
+	if start > 0 {
+		lines = append(
+			lines,
+			mutedStyle.Render("  ↑ more"),
+		)
+	}
+
+	for i := start; i < end; i++ {
+		node := children[i]
+
 		cursor := "  "
 		style := lipgloss.NewStyle().
 			Foreground(colorText)
@@ -1116,11 +1246,22 @@ func (m Model) renderHierarchy(width, height int) string {
 			}
 		}
 
+		prefix := "├─ "
+
+		if i == len(children)-1 {
+			prefix = "└─ "
+		}
+
 		lines = append(
 			lines,
-			style.Render(
-				cursor+"├─ "+node.ID,
-			),
+			style.Render(cursor+prefix+node.ID),
+		)
+	}
+
+	if end < len(children) {
+		lines = append(
+			lines,
+			mutedStyle.Render("  ↓ more"),
 		)
 	}
 
@@ -1131,99 +1272,15 @@ func (m Model) renderHierarchy(width, height int) string {
 	).Render(strings.Join(lines, "\n"))
 }
 
-func (m Model) renderFooter(width, height int) string {
-	var shortcuts []string
-
-	if m.editing {
-		shortcuts = []string{
-			keyStyle.Render("Type") + " edit",
-			keyStyle.Render("Enter") + " apply",
-			keyStyle.Render("Esc") + " cancel",
-		}
-	} else {
-		switch m.panel {
-		case PanelPalette:
-			shortcuts = []string{
-				keyStyle.Render("↑↓") + " navigate",
-				keyStyle.Render("Enter/A") + " add",
-				keyStyle.Render("Tab") + " panels",
-				keyStyle.Render("Q") + " quit",
-			}
-
-		case PanelCanvas:
-			shortcuts = []string{
-				keyStyle.Render("←↑↓→") + " move",
-				keyStyle.Render("Shift+Arrows") + " resize",
-				keyStyle.Render("D") + " delete",
-				keyStyle.Render("Tab") + " panels",
-			}
-
-		case PanelHierarchy:
-			shortcuts = []string{
-				keyStyle.Render("↑↓") + " navigate",
-				keyStyle.Render("Enter") + " select",
-				keyStyle.Render("D") + " delete",
-				keyStyle.Render("Tab") + " panels",
-			}
-
-		case PanelInspector:
-			shortcuts = []string{
-				keyStyle.Render("↑↓") + " properties",
-				keyStyle.Render("Enter") + " edit",
-				keyStyle.Render("Tab") + " panels",
-				keyStyle.Render("Q") + " quit",
-			}
-		}
-	}
-
-	// Available content width after the left/right padding.
-	available := width - 3
-
-	if available < 1 {
-		available = 1
-	}
-
-	// Build lines without allowing them to exceed the terminal.
-	var rows []string
-	var current string
-
-	for _, shortcut := range shortcuts {
-		// Lip Gloss escape sequences make len() inaccurate, so use
-		// lipgloss.Width() for terminal display width.
-		candidate := shortcut
-
-		if current != "" {
-			candidate = current + "  " + shortcut
-		}
-
-		if current != "" &&
-			lipgloss.Width(candidate) > available {
-			rows = append(rows, current)
-			current = shortcut
-			continue
-		}
-
-		current = candidate
-	}
-
-	if current != "" {
-		rows = append(rows, current)
-	}
-
-	content := strings.Join(rows, "\n")
-
-	footerHeight := len(rows)
-
-	if footerHeight < 1 {
-		footerHeight = 1
-	}
+func (m Model) renderFooter(width int) string {
+	rows := m.footerRows(width)
 
 	return lipgloss.NewStyle().
 		Width(width).
-		Height(footerHeight).
+		Height(len(rows)).
 		BorderTop(true).
 		BorderForeground(colorBorder).
 		PaddingLeft(1).
 		Foreground(colorMuted).
-		Render(content)
+		Render(strings.Join(rows, "\n"))
 }
